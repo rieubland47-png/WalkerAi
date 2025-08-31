@@ -1,0 +1,315 @@
+// Android Jetpack Compose single-Activity sample
+// "Petit bonhomme" qui apprend à marcher via une simple recherche aléatoire
+// (hill-climbing) sur les paramètres d'un contrôleur périodique.
+//
+// ❗️Instructions rapides
+// 1) Crée un projet Android Studio "Empty Activity" (Kotlin, minSdk 24+).
+// 2) Active Jetpack Compose (voir extrait Gradle ci-dessous).
+// 3) Remplace MainActivity.kt par ce fichier.
+// 4) Lance sur un émulateur/terminal et appuie sur "Train".
+//
+// build.gradle (Module: app) – extrait minimal
+// android {
+//   compileSdk 34
+//   defaultConfig { applicationId "com.example.walkerai" minSdk 24 targetSdk 34 }
+//   buildFeatures { compose true }
+//   composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+// }
+// dependencies {
+//   implementation(platform("androidx.compose:compose-bom:2025.01.00"))
+//   implementation("androidx.activity:activity-compose:1.9.2")
+//   implementation("androidx.compose.ui:ui")
+//   implementation("androidx.compose.ui:ui-tooling-preview")
+//   implementation("androidx.compose.material3:material3:1.3.0")
+//   debugImplementation("androidx.compose.ui:ui-tooling")
+//   implementation("androidx.datastore:datastore-preferences:1.1.1")
+// }
+
+package com.example.walkerai
+
+import android.os.Bundle
+import android.content.Context
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlin.math.*
+import java.util.Locale
+
+// DataStore
+import androidx.datastore.preferences.preferencesDataStore
+import androidx.datastore.preferences.core.doublePreferencesKey
+import androidx.datastore.preferences.core.edit
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
+
+val Context.dataStore by preferencesDataStore("walker_prefs")
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent { App() }
+    }
+}
+
+// ----------------------
+// Sauvegarde/Chargement DataStore
+// ----------------------
+object PolicyStorage {
+    private val AKey = doublePreferencesKey("A")
+    private val WKey = doublePreferencesKey("W")
+    private val PKey = doublePreferencesKey("P")
+    private val KTKey = doublePreferencesKey("KTorso")
+    private val KHKey = doublePreferencesKey("KHip")
+
+    suspend fun save(context: Context, p: Policy) {
+        context.dataStore.edit { prefs ->
+            prefs[AKey] = p.A
+            prefs[WKey] = p.w
+            prefs[PKey] = p.p
+            prefs[KTKey] = p.kTorso
+            prefs[KHKey] = p.kHip
+        }
+    }
+
+    suspend fun load(context: Context): Policy? {
+        val prefs = context.dataStore.data.map { it }.first()
+        if (prefs.isEmpty()) return null
+        return Policy(
+            A = prefs[AKey] ?: 10.0,
+            w = prefs[WKey] ?: 2.0,
+            p = prefs[PKey] ?: 0.0,
+            kTorso = prefs[KTKey] ?: 5.0,
+            kHip = prefs[KHKey] ?: 1.0
+        )
+    }
+}
+
+// ----------------------
+// Modèle physique simplifié
+// ----------------------
+private data class Walker(
+    var x: Double = 0.0,
+    var y: Double = 1.0,
+    var vx: Double = 0.0,
+    var vy: Double = 0.0,
+    var torsoAngle: Double = 0.0,
+    var torsoVel: Double = 0.0,
+    var hipAngle: Double = 0.0,
+    var hipVel: Double = 0.0,
+    var stanceFootX: Double = 0.0,
+    var onGround: Boolean = true,
+)
+
+private const val G = 9.81
+private const val TORSO_M = 10.0
+private const val LEG_M = 2.0
+private const val HIP_INERTIA = 1.0
+private const val TORSO_INERTIA = 3.0
+private const val GROUND_Y = 0.0
+
+// ----------------------
+// Contrôleur paramétrique + apprentissage
+// ----------------------
+private data class Policy(
+    var A: Double,
+    var w: Double,
+    var p: Double,
+    var kTorso: Double,
+    var kHip: Double
+) {
+    fun torque(t: Double, torsoAngle: Double, hipAngle: Double): Double {
+        val base = A * sin(w * t + p)
+        val stabilise = -kTorso * torsoAngle - kHip * hipAngle
+        return (base + stabilise).coerceIn(-50.0, 50.0)
+    }
+
+    fun mutated(noise: Double): Policy = copy(
+        A = (A + randn() * noise).coerceIn(0.0, 80.0),
+        w = (w + randn() * noise).coerceIn(0.1, 10.0),
+        p = p + randn() * noise,
+        kTorso = (kTorso + randn() * noise).coerceIn(0.0, 50.0),
+        kHip = (kHip + randn() * noise).coerceIn(0.0, 50.0)
+    )
+}
+
+private fun randn(): Double {
+    val u1 = (1..100).random() / 100.0
+    val u2 = (1..100).random() / 100.0
+    return sqrt(-2.0 * ln(u1)) * cos(2 * Math.PI * u2)
+}
+
+private data class TrainerState(
+    var bestPolicy: Policy,
+    var bestScore: Double = Double.NEGATIVE_INFINITY,
+    var generation: Int = 0,
+    var noise: Double = 2.0,
+    var evaluating: Boolean = false,
+)
+
+// ----------------------
+// Simulation
+// ----------------------
+private class World {
+    val walker = Walker()
+    var t = 0.0
+    fun reset() { walker.apply {
+        x=0.0;y=1.0;vx=0.0;vy=0.0;torsoAngle=0.0;torsoVel=0.0;hipAngle=0.0;hipVel=0.0;stanceFootX=0.0;onGround=true
+    }; t=0.0 }
+    fun step(dt: Double, torqueHip: Double) {
+        t += dt
+        val hipAcc = torqueHip / HIP_INERTIA - 0.2 * walker.hipVel
+        walker.hipVel += hipAcc * dt
+        walker.hipAngle += walker.hipVel * dt
+        val torsoAcc = (-0.5 * walker.torsoAngle + 0.1 * walker.hipAngle) / TORSO_INERTIA - 0.2 * walker.torsoVel
+        walker.torsoVel += torsoAcc * dt
+        walker.torsoAngle += walker.torsoVel * dt
+        val thrust = 0.8 * sin(walker.hipAngle)
+        val drag = -0.1 * walker.vx
+        val ax = (thrust + drag) / (TORSO_M + LEG_M)
+        walker.vx += ax * dt
+        walker.x += walker.vx * dt
+        walker.vy += -G * dt
+        var y = walker.y + walker.vy * dt
+        if (y <= 1.0) { y = 1.0; walker.vy = 0.0; walker.onGround = true } else walker.onGround = false
+        walker.y = y
+        val footPhase = sin(walker.hipAngle)
+        if (footPhase > 0.95 && walker.vx > 0.1) walker.stanceFootX = walker.x + 0.2
+    }
+}
+
+private data class EpisodeResult(val score: Double, val fell: Boolean, val time: Double)
+
+private fun runEpisode(policy: Policy, seconds: Double = 8.0): EpisodeResult {
+    val world = World(); world.reset()
+    var dt = 1.0 / 120.0; var t = 0.0; var alive = true; var lastX = 0.0
+    while (t < seconds && alive) {
+        val torque = policy.torque(t, world.walker.torsoAngle, world.walker.hipAngle)
+        world.step(dt, torque); t += dt
+        if (abs(world.walker.torsoAngle) > 0.8 || world.walker.y < 0.9) alive = false
+        lastX = world.walker.x
+    }
+    val distance = lastX
+    val speedBonus = distance / seconds
+    val fallPenalty = if (alive) 0.0 else -1.0
+    val score = distance + 0.2 * speedBonus + fallPenalty
+    return EpisodeResult(score, !alive, t)
+}
+
+// ----------------------
+// UI + entraînement
+// ----------------------
+@Composable
+fun App() {
+    MaterialTheme(colorScheme = darkColorScheme()) {
+        Surface(Modifier.fillMaxSize().background(Color(0xFF0B1020))) { WalkerScreen() }
+    }
+}
+
+@Composable
+fun WalkerScreen() {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var running by remember { mutableStateOf(false) }
+    val world = remember { World().apply { reset() } }
+    var trainer by remember {
+        mutableStateOf(TrainerState(Policy(A=10.0,w=2.5,p=0.0,kTorso=5.0,kHip=1.0)))
+    }
+    var episodeTime by remember { mutableStateOf(0.0) }
+    var lastScore by remember { mutableStateOf(0.0) }
+
+    LaunchedEffect(running) {
+        while (running) {
+            trainer.evaluating = true
+            val mutant = trainer.bestPolicy.mutated(trainer.noise)
+            val result = runEpisode(mutant, seconds = 6.0)
+            if (result.score > trainer.bestScore) { trainer.bestScore = result.score; trainer.bestPolicy = mutant }
+            trainer.generation += 1
+            trainer.noise = (trainer.noise * 0.995).coerceAtLeast(0.15)
+            trainer.evaluating = false
+            world.reset(); episodeTime = 0.0
+            var t = 0.0; val dt = 1.0/120.0
+            while (t < 6.0 && running) {
+                val torque = trainer.bestPolicy.torque(t, world.walker.torsoAngle, world.walker.hipAngle)
+                world.step(dt, torque)
+                t+=dt; episodeTime = t; lastScore = trainer.bestScore
+                delay(0L)
+            }
+        }
+    }
+
+    Column(Modifier.fillMaxSize().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("Petit bonhomme qui apprend à marcher", fontSize=22.sp, fontWeight=FontWeight.Bold)
+        Spacer(Modifier.height(8.dp))
+        MetricsBar(trainer,lastScore)
+        Spacer(Modifier.height(8.dp))
+        Box(Modifier.weight(1f).fillMaxWidth().background(Color(0xFF0F152C))) { WalkerCanvas(world) }
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Button(onClick={running=!running}){ Text(if(running)\"Pause\" else \"Train\") }
+            OutlinedButton(onClick={ world.reset(); trainer=trainer.copy(bestScore=Double.NEGATIVE_INFINITY,generation=0,noise=2.0) }){ Text(\"Reset\") }
+            OutlinedButton(onClick={ scope.launch { PolicyStorage.save(context, trainer.bestPolicy) } }){ Text(\"Save\") }
+            OutlinedButton(onClick={ scope.launch { PolicyStorage.load(context)?.let{trainer=trainer.copy(bestPolicy=it,bestScore=0.0)} } }){ Text(\"Load\") }
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(\"Conseil: laisse tourner 30–60 s pour voir la démarche s'améliorer.\\n\\n\" +
+            \"Limites & pistes d'amélioration :\\n\" +
+            \"- Modèle jouet (physique simplifiée).\\n\" +
+            \"- Ajouter un deuxième segment de jambe (genou) et plusieurs muscles/torques.\\n\" +
+            \"- Passer sur un algo RL type Policy Gradient ou TD3 (plus stable).\\n\" +
+            \"- Enregistrer/recharger la meilleure politique (DataStore).\\n\" +
+            \"- Augmenter la fidélité physique (friction, collisions multiples).\\n\" +
+            \"- Créer une version React Native ou Flutter pour multiplateforme.\\n\" +
+            \"- Intégrer un export/chargement des meilleurs paramètres directement dans l’appli.\", fontSize=12.sp, color=Color.LightGray)
+        ParamRow(trainer.bestPolicy)
+        Spacer(Modifier.height(8.dp))
+    }
+}
+
+@Composable
+private fun MetricsBar(trainer: TrainerState, lastScore: Double) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) {
+        StatChip(\"Gen\", trainer.generation.toString())
+        StatChip(\"Best\", String.format(Locale.ROOT, \"%.3f\", lastScore))
+        StatChip(\"Noise\", String.format(Locale.ROOT, \"%.2f\", trainer.noise))
+        StatChip(\"Evaluating\", if (trainer.evaluating) \"Yes\" else \"No\")
+    }
+}
+
+@Composable private fun StatChip(label:String,value:String){ AssistChip(onClick={}, label={Text(\"$label: $value\")}) }
+@Composable private fun ParamRow(p:Policy){ Column(Modifier.fillMaxWidth()){ Text(\"A=${p.A.format2()} w=${p.w.format2()} p=${p.p.format2()} kTorso=${p.kTorso.format2()} kHip=${p.kHip.format2()}\", fontSize=12.sp) } }
+private fun Double.format2():String=String.format(Locale.ROOT,\"%.2f\",this)
+
+// ----------------------
+// Dessin Canvas
+// ----------------------
+@Composable
+private fun WalkerCanvas(world: World) {
+    val padding=20f
+    Canvas(Modifier.fillMaxSize()){
+        val W=size.width; val H=size.height; val scale=min(W,H)/4f
+        val camX=(world.walker.x*scale).toFloat(); val originX=W/2f-camX; val originY=H-padding
+        drawLine(Color(0xFF2B355B),Offset(0f,originY),Offset(W,originY),strokeWidth=3f)
+        fun wx(x:Double)=originX+(x*scale).toFloat()
+        fun wy(y:Double)=originY-((y-GROUND_Y)*scale).toFloat()
+        val hipX=wx(world.walker.x); val hipY=wy(world.walker.y)
+        val footX=wx(world.walker.stanceFootX); val footY=wy(GROUND_Y)
+        drawLine(Color(0xFF6C89FF),Offset(footX,footY),Offset(footX,footY-8f),strokeWidth=6f)
+        drawLine(Color(0xFFAAD1FF),Offset(hipX,hipY),Offset(footX,footY),strokeWidth=8f)
+        val torsoLen=0.6f*scale; val tx=hipX+(sin(world.walker.torsoAngle)*torsoLen); val ty=hipY-(cos(world.walker.torsoAngle)*torsoLen)
+        drawLine(Color(0xFFB5F7D8),Offset(hipX,hipY),Offset(tx,ty),strokeWidth=10f)
+        drawCircle(Color(0xFFB5F7D8),radius=12f,center=Offset(tx,ty-18f))
+    }
+}
